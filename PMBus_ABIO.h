@@ -1,12 +1,15 @@
-
-//#include <cstdint>
+#include <cstdint>
+#include <filesystem>
 #include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <Wire.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_I2CDevice.h>
 
-#ifndef RPB_1600_H
-#define RPB_1600_H
+#ifndef PMBus_ABIO_H
+#define PMBus_ABIO_H
 
 // Uncomment the below #define to enable debugging print statements.
 // NOTE: You must call Serial.being(<baud rate>) in your setup() for this to work
@@ -23,11 +26,29 @@
 #define MANTISSA_LENGTH 11
 #define N_EXPONENT_SHIFT MANTISSA_LENGTH
 
+#define GOOD 0x01
+#define NOTBEGUNERR 0x02
+#define NOWRITEERR 0x04
+#define NOREADERR 0x08
+#define BADBUFFER 0x10
+
+// PMBus v1.1 Capability Bits
+#define CRCCAPABILITY 0x80
+#define BUSCAPABILITY 0x60
+#define ALERTCAPABILITY 0x10
+
+// PMBus v1.1 Operation bits
+#define OPERATIONIMMOFF 0X00
+#define OPERATIONSOFTOFF 0X40
+#define OPERATIONON 0X80
+#define OPERATIONONOFFMASK 0X
+#define OPERATIONMARGINMASK 0X
+
 struct readings
 {
     uint16_t v_in;
     float v_out;
-    uint16_t i_out;
+    float i_out;
     //uint16_t fan_speed_1;
     //uint16_t fan_speed_2;
 };
@@ -41,6 +62,81 @@ struct mfr_data
     char date[6];
     char serial[12];
 };
+
+struct buffer_data
+{
+    uint8_t buffer[MAX_RECEIVE_BYTES];
+    uint8_t bufferLength;
+};
+
+struct capability
+{
+    bool CRC;
+    uint8_t BUS;
+    bool ALT;
+};
+
+struct status
+{
+    uint8_t onOff;
+    uint8_t onOffControl;
+};
+
+struct PMBusStatus
+{
+    // STATUS_BYTE bits (lower 8 bits of STATUS_WORD)
+    uint8_t busy;
+    uint8_t off;
+    uint8_t vout_ov;
+    uint8_t iout_oc;
+    uint8_t vin_uv;
+    uint8_t temperature;
+    uint8_t cml;
+    uint8_t none_of_the_above;
+
+    // Upper 8 bits of STATUS_WORD
+    uint8_t vout;
+    uint8_t iout;
+    uint8_t input;
+    uint8_t mfr_specific;
+    uint8_t power_good_negated;
+    uint8_t fans;
+    uint8_t other;
+    uint8_t unknown;
+};
+
+struct operationByte
+{
+    uint8_t onOff;
+    uint8_t offType;
+    uint8_t marginCall;
+    uint8_t faultAction;
+};
+
+enum SystemConfig
+{
+    SC_NONE,
+    PM_CTRL,
+    OPERATION_INIT,
+    EEP_CONFIG,
+    EEP_OFF
+};
+
+enum OperationFields
+{
+    OF_NONE,
+    ON_OFF,
+    OFF_TYPE,
+    MARGIN_CALL,
+    FAULT_ACTION
+};
+
+enum ON_OFF
+{
+    ON,
+    OFF
+};
+
 #ifdef USECHARGER
 struct curve_config
 {
@@ -102,16 +198,22 @@ struct curve_parameters
     charge_status status;
 };
 #endif
-class RPB_1600
+class PMBus_ABIO
 {
 public:
-    RPB_1600();
+    // Constructor, twi is the 2-wire interface, the clk during and after is to keep compatibility
+    // with other devices that might use different frequencies
+    PMBus_ABIO(TwoWire *wire = &Wire, uint32_t clkDuring = 100000UL, uint32_t clkAfter = 100000UL);
+
+    // Destructor
+    ~PMBus_ABIO(void);
+
     /**
      * @brief Buffer to hold bytes received over i2c
      */
     uint8_t my_rx_buffer[MAX_RECEIVE_BYTES];
 
-    bool Init(uint8_t chargerAddress);
+    uint8_t Init(uint8_t i2caddr);
 
     /**
      * @brief Query charger for voltage & current readings, populate a "readings" struct
@@ -132,10 +234,14 @@ public:
     bool getCurveParams(curve_parameters *params);
 #endif
     /**
-     * @brief Write two arbitrary bytes with commandID
+     * @brief Write arbitrary bytes with commandID
      * @return true on successful write, false otherwise
      */
-    bool writeTwoBytes(uint8_t commandID, uint8_t *data);
+    uint8_t writeTwoBytes(uint8_t commandID, uint8_t *data, uint8_t length = 2);
+
+    // val is desired value (ignored if nothing being written)
+    // Item selects the thing being written
+    bool setControl(uint8_t val, SystemConfig item);
 
     /**
      * @brief Write linear value with specified commandID & N
@@ -144,13 +250,13 @@ public:
      * @param value the value you want to write (NOT the Y value)
      * @return True on success, false on failure
      */
-    bool writeLinearDataCommand(uint8_t commandID, int8_t N, int16_t value);
+    bool writeLinearDataCommand(uint8_t commandID, int8_t N, float value);
 
     /**
      * @brief Sends commandID to the charger, and reads the receiveLength byte(s) long response into my_rx_buffer[]
      * @return true if we received the number of bytes we were expecting, false otherwise.
      */
-    bool readWithCommand(uint8_t commandID, uint8_t receiveLength);
+    uint8_t readWithCommand(uint8_t commandID, uint8_t receiveLength);
 
     /**
     * @brief Pulls the mfgr information
@@ -164,7 +270,53 @@ public:
      */
      uint16_t parseLinearData(void);
 
+     /**
+      * @brief Returns the RX buffer
+      * @return full RX buffer of type buffer_data
+      */
+    bool returnBufferData(buffer_data *bufferhandle);
+
+    /**
+     * @brief Pulls the capabilities from the device to an internal structure
+     * @return returns an error code
+     */
+    uint8_t getCapability();
+
+    /**
+     * @brief Returns the capabilities from the device for nebulous future uses
+     * @return returns the capability data object
+     */
+    uint8_t returnCapability(capability* data);
+
+    bool pullStatus();
+
+    bool print_status_bits(PMBusStatus *status);
+
+    bool runOperation(OperationFields opfield, uint8_t bitPosition, uint8_t bitMask, uint8_t value);
+
+    float parseOutputCurrent();
+
+    float readOutputCurrent();
+
+    bool writeVoutTrim(float trim, int8_t N, float lowerBound, float upperBound);
+
+    bool setOCFaultLimit(float currentLimit, int8_t N);
+
 private:
+    Adafruit_I2CDevice *i2c_dev;
+    buffer_data *rxbuffer;
+    uint8_t runningClk;
+    mfr_data *data;
+    capability *capa;
+    status *stats;
+    PMBusStatus *internalStatus;
+    operationByte *Operations;
+
+    #if ARDUINO >= 157
+  uint32_t wireClk;    ///< Wire speed for SSD1306 transfers
+  uint32_t restoreClk; ///< Wire speed following SSD1306 transfers
+#endif
+
     /**
      * @brief The address of the charger we're communicating with
      * @details This is set using the A0, A1, and A2 pins on the RPB-1600. These three pins control
@@ -172,9 +324,7 @@ private:
      * pins are tied high, the address would be 0x47.
      * @note Address 0 is a reserved address.
      */
-    uint8_t my_charger_address;
-
-    
+    uint8_t pmbus_addr;
 
     /**
      * @brief Helper for writing linear data with a specified commandID
@@ -184,8 +334,6 @@ private:
      * @return True on success, false on failure
      */
     bool writeLinearDataHelper(uint8_t commandID, int8_t N, int16_t Y);
-
-    
 
     /**
      * @brief Parse a voltage reading in the linear format
@@ -215,6 +363,12 @@ private:
      * @brief Zeros my_rx_buffer
      */
     void clearRXBuffer(void);
+
+    bool readFromWrapper(uint8_t len);
+
+    bool parse_status_word(buffer_data *status_bytes, PMBusStatus *status);
+
+
 };
 
 #endif // RPB_1600_H
